@@ -291,11 +291,12 @@ mod dp_e2e_tests {
         dp_size: usize,
     ) -> RouterConfig {
         RouterConfig {
-            mode: RoutingMode::PrefillDecode {
+            mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls,
                 decode_urls,
                 prefill_policy: None,
                 decode_policy: None,
+                discovery_address: None,
             },
             policy: PolicyConfig::RoundRobin,
             host: "127.0.0.1".to_string(),
