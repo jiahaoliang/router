@@ -165,21 +165,30 @@ impl VllmPDRouter {
         }
     }
 
-    /// Build kv_transfer_params for the prefill request
-    fn build_prefill_kv_transfer_params(&self, transfer_id: Option<&str>) -> Value {
+    /// Build kv_transfer_params for the prefill request.
+    ///
+    /// Returns an error for MoRI-IO when no transfer mode has been registered yet, so that
+    /// requests are not silently dispatched in READ mode when no instances have registered.
+    fn build_prefill_kv_transfer_params(
+        &self,
+        transfer_id: Option<&str>,
+    ) -> Result<Value, String> {
         match self.kv_connector {
-            KvConnector::Mooncake => {
-                json!({
-                    "do_remote_decode": true,
-                    "do_remote_prefill": false,
-                    "transfer_id": transfer_id.unwrap_or(""),
-                })
-            }
+            KvConnector::Mooncake => Ok(json!({
+                "do_remote_decode": true,
+                "do_remote_prefill": false,
+                "transfer_id": transfer_id.unwrap_or(""),
+            })),
             KvConnector::MoriIO => {
-                if matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write)) {
+                let mode = self.moriio_transfer_mode().ok_or_else(|| {
+                    "No MoRI-IO instances have registered a transfer mode; \
+                     cannot dispatch request without knowing READ vs WRITE mode"
+                        .to_string()
+                })?;
+                if matches!(mode, MoriIOTransferMode::Write) {
                     // WRITE mode: prefill pushes KV blocks to decode.
                     // do_remote_decode=true tells the prefill connector to initiate the transfer.
-                    json!({
+                    Ok(json!({
                         "do_remote_decode": true,
                         "do_remote_prefill": false,
                         "remote_engine_id": serde_json::Value::Null,
@@ -189,29 +198,27 @@ impl VllmPDRouter {
                         // hardcoded to 1 until https://github.com/vllm-project/vllm/issues/41211 is resolved.
                         "remote_tp_size": 1,
                         "transfer_id": transfer_id.unwrap_or(""),
-                    })
+                    }))
                 } else {
-                    // READ mode (default): prefill waits for decode to pull blocks.
-                    json!({
+                    // READ mode: prefill waits for decode to pull blocks.
+                    Ok(json!({
                         "do_remote_decode": true,
                         "do_remote_prefill": false,
                         "remote_engine_id": serde_json::Value::Null,
                         "remote_block_ids": serde_json::Value::Null,
                         "transfer_id": transfer_id.unwrap_or(""),
                         "remote_dp_size": self.intra_node_data_parallel_size,
-                    })
+                    }))
                 }
             }
-            KvConnector::Nixl => {
-                json!({
-                    "do_remote_decode": true,
-                    "do_remote_prefill": false,
-                    "remote_engine_id": serde_json::Value::Null,
-                    "remote_block_ids": serde_json::Value::Null,
-                    "remote_host": serde_json::Value::Null,
-                    "remote_port": serde_json::Value::Null
-                })
-            }
+            KvConnector::Nixl => Ok(json!({
+                "do_remote_decode": true,
+                "do_remote_prefill": false,
+                "remote_engine_id": serde_json::Value::Null,
+                "remote_block_ids": serde_json::Value::Null,
+                "remote_host": serde_json::Value::Null,
+                "remote_port": serde_json::Value::Null
+            })),
         }
     }
 
@@ -634,7 +641,7 @@ impl VllmPDRouter {
 
         // Add kv_transfer_params for KV connector support at top level
         prefill_request["kv_transfer_params"] =
-            self.build_prefill_kv_transfer_params(transfer_id.as_deref());
+            self.build_prefill_kv_transfer_params(transfer_id.as_deref())?;
 
         debug!(
             "Added kv_transfer_params to prefill request for {:?} connector",
@@ -1083,8 +1090,9 @@ impl VllmPDRouter {
         let transfer_id = self.generate_transfer_id();
 
         // Add kv_transfer_params for KV connector support at top level
-        prefill_request["kv_transfer_params"] =
-            self.build_prefill_kv_transfer_params(transfer_id.as_deref());
+        prefill_request["kv_transfer_params"] = self
+            .build_prefill_kv_transfer_params(transfer_id.as_deref())
+            .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
 
         debug!(
             "Added kv_transfer_params to prefill request for {:?} connector",
