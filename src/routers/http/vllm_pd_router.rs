@@ -632,7 +632,7 @@ impl VllmPDRouter {
         }
     }
 
-    /// Handle the decode response shared by both READ and WRITE dispatch paths.
+    /// Handle the decode response shared by both sequential and concurrent dispatch paths.
     /// Stops decode profiling, records metrics, then routes to streaming, logprobs-merge,
     /// or plain full-body response depending on the original request.
     #[allow(clippy::too_many_arguments)]
@@ -787,7 +787,8 @@ impl VllmPDRouter {
         let (decode_base_http, decode_dp_rank) =
             extract_base_http_and_dp_rank(decode_http, self.intra_node_data_parallel_size);
 
-        let is_moriio_write = matches!(self.kv_connector, KvConnector::MoriIO)
+        // Concurrent dispatch: e.g. MoRI-IO WRITE mode
+        let is_concurrent_dispatch = matches!(self.kv_connector, KvConnector::MoriIO)
             && matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write));
 
         let needs_logprobs = request_json.get("logprobs").is_some()
@@ -806,9 +807,9 @@ impl VllmPDRouter {
         let prefill_request_url = format!("http://{}{}", prefill_base_http, path);
 
         // Stage 1: dispatch prefill.
-        // READ mode: send now and await — decode kv_transfer_params come from the prefill response.
-        // WRITE mode: skip; prefill is sent concurrently with decode in Stage 2 via tokio::join!.
-        let prefill_response_json: Option<Value> = if is_moriio_write {
+        // Sequential mode: send now and await — decode kv_transfer_params come from the prefill response.
+        // Concurrent mode: skip; prefill is sent concurrently with decode in Stage 2 via tokio::join!.
+        let prefill_response_json: Option<Value> = if is_concurrent_dispatch {
             None
         } else {
             debug!(
@@ -936,10 +937,10 @@ impl VllmPDRouter {
 
         let decode_request_url = format!("http://{}{}", decode_base_http, path);
 
-        // WRITE mode: run prefill and decode concurrently via tokio::join! so the prefill
+        // Concurrent dispatch: run prefill and decode concurrently via tokio::join! so the prefill
         // task is always guaranteed to execute (unlike fire-and-forget tokio::spawn, which
         // can be silently dropped under load) and both HTTP sends start at the same time.
-        if is_moriio_write {
+        if is_concurrent_dispatch {
             self.start_profiling(&format!("http://{}", prefill_base_http))
                 .await;
             // Capture references rather than clones — tokio::join! polls both futures on the
@@ -981,33 +982,30 @@ impl VllmPDRouter {
                         match resp.bytes().await {
                             Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                                 Ok(json) => {
-                                    debug!(
-                                        "MoRI-IO WRITE prefill completed with status {}",
-                                        status
-                                    );
+                                    debug!("Concurrent prefill completed with status {}", status);
                                     Ok(Some(json))
                                 }
                                 Err(_) => {
                                     debug!(
-                                        "MoRI-IO WRITE prefill completed with status {} (non-JSON body)",
+                                        "Concurrent prefill completed with status {} (non-JSON body)",
                                         status
                                     );
                                     Ok(None)
                                 }
                             },
                             Err(e) => {
-                                warn!("MoRI-IO WRITE prefill: failed to read response body: {}", e);
+                                warn!("Concurrent prefill: failed to read response body: {}", e);
                                 Ok(None)
                             }
                         }
                     }
                     Ok(resp) => {
                         let status = resp.status();
-                        warn!("MoRI-IO WRITE prefill returned non-2xx status: {}", status);
+                        warn!("Concurrent prefill returned non-2xx status: {}", status);
                         Err(format!("Prefill request failed with status {}", status))
                     }
                     Err(e) => {
-                        warn!("MoRI-IO WRITE prefill request failed: {}", e);
+                        warn!("Concurrent prefill request failed: {}", e);
                         Err(format!("Prefill request failed: {}", e))
                     }
                 }
@@ -1023,7 +1021,7 @@ impl VllmPDRouter {
                 },
             );
             let (prefill_result, decode_result) = tokio::join!(prefill_fut, decode_fut);
-            let write_prefill_response_json: Option<Value> = match prefill_result {
+            let concurrent_prefill_response_json: Option<Value> = match prefill_result {
                 Err(prefill_err) => {
                     self.stop_profiling(&format!("http://{}", decode_base_http))
                         .await;
@@ -1057,7 +1055,7 @@ impl VllmPDRouter {
             return self
                 .handle_decode_response(
                     decode_response,
-                    write_prefill_response_json.as_ref(),
+                    concurrent_prefill_response_json.as_ref(),
                     path,
                     prefill_http,
                     decode_http,
@@ -1332,7 +1330,7 @@ impl VllmPDRouter {
                 );
             }
         } else {
-            // NIXL and MoRI-IO: extract kv_transfer_params from prefill response
+            // Sequential dispatch (NIXL, MoRI-IO READ): extract kv_transfer_params from prefill response
             if let Some(mut params) = kv_transfer_params {
                 if matches!(self.kv_connector, KvConnector::MoriIO) {
                     // MoRI-IO decode connector needs to know how many prefill DP ranks to handshake with.
