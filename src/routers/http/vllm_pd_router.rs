@@ -1040,6 +1040,8 @@ impl VllmPDRouter {
             let decode_response = match decode_result {
                 Ok(resp) => resp,
                 Err(e) => {
+                    self.stop_profiling(&format!("http://{}", decode_base_http))
+                        .await;
                     let full_error = error_chain(&e);
                     let duration = start_time.elapsed();
                     RouterMetrics::record_pd_decode_error(decode_http);
