@@ -64,7 +64,7 @@ use std::collections::HashMap;
 pub enum ChatMessage {
     System {
         role: String,
-        content: String,
+        content: UserMessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
@@ -77,14 +77,15 @@ pub enum ChatMessage {
     Assistant {
         role: String, // "assistant"
         #[serde(skip_serializing_if = "Option::is_none")]
-        content: Option<String>,
+        content: Option<UserMessageContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<ToolCall>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         function_call: Option<FunctionCallResponse>,
-        /// Reasoning content for reasoning models
+        /// Reasoning content for reasoning models. The custom Deserialize impl
+        /// below also accepts the deprecated `reasoning_content` alias.
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning: Option<String>,
     },
@@ -116,12 +117,10 @@ impl<'de> Deserialize<'de> for ChatMessage {
         match role {
             "assistant" => Ok(ChatMessage::Assistant {
                 role: role.to_string(),
-                content: value.get("content").and_then(|c| {
-                    if c.is_null() {
-                        None
-                    } else {
-                        c.as_str().map(String::from)
-                    }
+                content: value.get("content").and_then(|content| {
+                    (!content.is_null())
+                        .then(|| serde_json::from_value(content.clone()).ok())
+                        .flatten()
                 }),
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
@@ -144,21 +143,22 @@ impl<'de> Deserialize<'de> for ChatMessage {
                         serde_json::from_value(fc.clone()).ok()
                     }
                 }),
-                reasoning: value.get("reasoning").and_then(|r| {
-                    if r.is_null() {
-                        None
-                    } else {
-                        r.as_str().map(String::from)
-                    }
-                }),
+                // `reasoning` is vLLM's canonical field. Prefer a usable canonical
+                // string when both keys are present; otherwise fall back to the
+                // deprecated `reasoning_content` alias, including when `reasoning`
+                // is null or not a string. Serialization remains canonical.
+                reasoning: value
+                    .get("reasoning")
+                    .and_then(Value::as_str)
+                    .or_else(|| value.get("reasoning_content").and_then(Value::as_str))
+                    .map(String::from),
             }),
             "system" => Ok(ChatMessage::System {
                 role: role.to_string(),
                 content: value
                     .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("")
-                    .to_string(),
+                    .and_then(|content| serde_json::from_value(content.clone()).ok())
+                    .unwrap_or(UserMessageContent::Text(String::new())),
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
                         None
@@ -265,6 +265,23 @@ pub struct StructuredOutputsParams {
 pub enum UserMessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+}
+
+impl UserMessageContent {
+    /// Return non-empty textual parts in wire order for prefix-aware routing.
+    fn routing_texts(&self) -> Vec<&str> {
+        match self {
+            Self::Text(text) if !text.trim().is_empty() => vec![text.as_str()],
+            Self::Text(_) => Vec::new(),
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -474,8 +491,8 @@ pub struct ChatCompletionRequest {
     pub ignore_eos: bool,
 
     /// Add generation prompt to the chat template
-    #[serde(default = "default_true")]
-    pub add_generation_prompt: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add_generation_prompt: Option<bool>,
 
     /// Continue generating from final assistant message
     #[serde(default)]
@@ -514,7 +531,7 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub echo: Option<bool>,
 
-    /// Reasoning effort level for reasoning models (low, medium, high)
+    /// Reasoning effort level for reasoning models
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
 
@@ -540,19 +557,122 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        // Use session_id from session_params for session-based routing
-        if let Some(ref session_params) = self.session_params {
-            if let Some(session_id) = session_params.get("session_id") {
-                if let Some(session_id_str) = session_id.as_str() {
-                    if !session_id_str.trim().is_empty() {
-                        return session_id_str.to_string();
+        self.session_params
+            .as_ref()
+            .and_then(|params| params.get("session_id"))
+            .and_then(Value::as_str)
+            .filter(|session_id| !session_id.trim().is_empty())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn extract_text_for_program_scheduling(&self) -> String {
+        let mut parts = Vec::new();
+        for message in &self.messages {
+            match message {
+                ChatMessage::System { content, .. } => {
+                    for text in content.routing_texts() {
+                        parts.push(format!("system:{}", text.trim()));
                     }
                 }
+                ChatMessage::User { content, .. } => {
+                    for text in content.routing_texts() {
+                        parts.push(format!("user:{}", text.trim()));
+                    }
+                }
+                ChatMessage::Assistant {
+                    content,
+                    tool_calls,
+                    function_call,
+                    ..
+                } => {
+                    if let Some(content) = content {
+                        for text in content.routing_texts() {
+                            parts.push(format!("assistant:{}", text.trim()));
+                        }
+                    }
+                    if let Some(calls) = tool_calls {
+                        for call in calls {
+                            if let Some(arguments) = &call.function.arguments {
+                                if !arguments.trim().is_empty() {
+                                    parts.push(format!(
+                                        "assistant_tool_call:{}:{}",
+                                        call.function.name.trim(),
+                                        arguments.trim()
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(call) = function_call {
+                        if let Some(arguments) = &call.arguments {
+                            if !arguments.trim().is_empty() {
+                                parts.push(format!(
+                                    "assistant_function_call:{}:{}",
+                                    call.name.trim(),
+                                    arguments.trim()
+                                ));
+                            }
+                        }
+                    }
+                }
+                ChatMessage::Tool { content, .. } => {
+                    if let Some(text) = content.as_str() {
+                        if !text.trim().is_empty() {
+                            parts.push(format!("tool:{}", text.trim()));
+                        }
+                    } else if let Some(items) = content.as_array() {
+                        for item in items {
+                            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                                if !text.trim().is_empty() {
+                                    parts.push(format!("tool:{}", text.trim()));
+                                }
+                            }
+                        }
+                    }
+                }
+                ChatMessage::Function { content, name, .. } if !content.trim().is_empty() => {
+                    parts.push(format!("function:{}:{}", name.trim(), content.trim()));
+                }
+                _ => {}
             }
         }
+        if let Some(tools) = &self.tools {
+            let mut tools = tools.iter().collect::<Vec<_>>();
+            tools.sort_by(|left, right| left.function.name.cmp(&right.function.name));
+            for tool in tools {
+                let parameters = serde_json::to_string(&tool.function.parameters)
+                    .unwrap_or_else(|_| "{}".to_string());
+                parts.push(format!(
+                    "tool_schema:{}:{}:{}",
+                    tool.function.name.trim(),
+                    tool.function.description.as_deref().unwrap_or("").trim(),
+                    parameters
+                ));
+            }
+        }
+        if let Some(functions) = &self.functions {
+            let mut functions = functions.iter().collect::<Vec<_>>();
+            functions.sort_by(|left, right| left.name.cmp(&right.name));
+            for function in functions {
+                let parameters = serde_json::to_string(&function.parameters)
+                    .unwrap_or_else(|_| "{}".to_string());
+                parts.push(format!(
+                    "function_schema:{}:{}:{}",
+                    function.name.trim(),
+                    function.description.as_deref().unwrap_or("").trim(),
+                    parameters
+                ));
+            }
+        }
+        if !parts.is_empty() {
+            return parts.join("\n");
+        }
+        self.extract_text_for_routing()
+    }
 
-        // Return empty string if no session_id - let routing policy handle this case
-        String::new()
+    fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
+        program_identity_payload(&self.other, self.user.as_deref())
     }
 }
 
@@ -764,6 +884,10 @@ impl GenerationRequest for CompletionRequest {
     fn extract_text_for_routing(&self) -> String {
         self.prompt.extract_text_for_routing()
     }
+
+    fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
+        program_identity_payload(&self.other, self.user.as_deref())
+    }
 }
 
 // ============= Regular Response =============
@@ -849,12 +973,16 @@ fn default_reasoning_effort() -> Option<ReasoningEffort> {
     Some(ReasoningEffort::Medium)
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
+    None,
+    Minimal,
     Low,
     Medium,
     High,
+    Xhigh,
+    Max,
 }
 
 // ============= Input/Output Items =============
@@ -1971,6 +2099,46 @@ impl GenerationRequest for GenerateRequest {
 }
 
 // ==================================================================
+// =   VLLM SPEC - DISAGG /inference/v1/generate API              =
+// ==================================================================
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InferenceGenerateRequest {
+    pub token_ids: Vec<i32>,
+
+    #[serde(default)]
+    pub stream: bool,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+impl GenerationRequest for InferenceGenerateRequest {
+    fn is_stream(&self) -> bool {
+        self.stream
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        self.token_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<String>>()
+            .join(" ")
+    }
+
+    fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
+        program_identity_payload(&self.other, None)
+    }
+}
+
+// ==================================================================
 // =            VLLM SPEC - RERANK API                            =
 // ==================================================================
 
@@ -2246,6 +2414,41 @@ pub trait GenerationRequest: Send + Sync {
 
     /// Extract text content for routing decisions
     fn extract_text_for_routing(&self) -> String;
+
+    /// Extract prompt content used only by opted-in Program scheduling.
+    fn extract_text_for_program_scheduling(&self) -> String {
+        self.extract_text_for_routing()
+    }
+
+    /// Extract only the small body subset used for Program identity parsing.
+    fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
+        None
+    }
+}
+
+fn program_identity_payload(
+    other: &serde_json::Map<String, serde_json::Value>,
+    user: Option<&str>,
+) -> Option<serde_json::Value> {
+    let mut payload = serde_json::Map::new();
+    for field in [
+        "vllm_xargs",
+        "agent_hint",
+        "session_params",
+        "session_id",
+        "user_id",
+    ] {
+        if let Some(value) = other.get(field) {
+            payload.insert(field.to_string(), value.clone());
+        }
+    }
+    if let Some(user) = user {
+        payload.insert(
+            "user".to_string(),
+            serde_json::Value::String(user.to_string()),
+        );
+    }
+    (!payload.is_empty()).then_some(serde_json::Value::Object(payload))
 }
 
 /// Helper type for string or array of strings
@@ -2370,7 +2573,99 @@ pub enum LoRAPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_identity_payload_excludes_generation_content() {
+        let other = serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
+            "vllm_xargs": {"agentic_context": {"program_id": "program-a"}},
+            "agent_hint": {"session_id": "session-a"},
+            "prompt": "must-not-be-copied",
+            "messages": ["must-not-be-copied"]
+        }))
+        .unwrap();
+        let payload = program_identity_payload(&other, Some("user-a")).unwrap();
+        assert_eq!(payload.as_object().unwrap().len(), 3);
+        assert!(payload.get("vllm_xargs").is_some());
+        assert!(payload.get("agent_hint").is_some());
+        assert_eq!(payload.get("user").unwrap(), "user-a");
+        assert!(payload.get("prompt").is_none());
+        assert!(payload.get("messages").is_none());
+    }
     use serde_json;
+
+    // ==================================================================
+    // =  InferenceGenerateRequest (/inference/v1/generate) TESTS       =
+    // ==================================================================
+
+    #[test]
+    fn test_inference_generate_routing_key_from_token_ids() {
+        let body = serde_json::json!({
+            "token_ids": [151644, 8948, 198, 2610],
+            "sampling_params": {"max_tokens": 4096, "seed": 42, "logprobs": 1}
+        });
+        let req: InferenceGenerateRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.extract_text_for_routing(), "151644 8948 198 2610");
+    }
+
+    #[test]
+    fn test_inference_generate_lossless_passthrough() {
+        let body = serde_json::json!({
+            "token_ids": [1, 2, 3],
+            "model": "qwen3-30b",
+            "sampling_params": {
+                "max_tokens": 4096,
+                "seed": 42,
+                "logprobs": 1,
+                "temperature": 1.0
+            }
+        });
+        let req: InferenceGenerateRequest = serde_json::from_value(body).unwrap();
+        let forwarded: serde_json::Value = serde_json::to_value(&req).unwrap();
+
+        assert_eq!(forwarded["token_ids"], serde_json::json!([1, 2, 3]));
+        assert_eq!(forwarded["sampling_params"]["max_tokens"], 4096);
+        assert_eq!(forwarded["sampling_params"]["seed"], 42);
+        assert_eq!(forwarded["sampling_params"]["logprobs"], 1);
+        assert_eq!(forwarded["sampling_params"]["temperature"], 1.0);
+        assert_eq!(forwarded["model"], "qwen3-30b");
+    }
+
+    #[test]
+    fn test_inference_generate_same_tokens_same_key_regardless_of_sampling() {
+        let make = |seed: i64| -> InferenceGenerateRequest {
+            serde_json::from_value(serde_json::json!({
+                "token_ids": [151644, 8948, 198],
+                "sampling_params": {"seed": seed}
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            make(1).extract_text_for_routing(),
+            make(2).extract_text_for_routing()
+        );
+    }
+
+    #[test]
+    fn test_inference_generate_is_stream() {
+        let non_stream: InferenceGenerateRequest =
+            serde_json::from_value(serde_json::json!({"token_ids": [1]})).unwrap();
+        assert!(!non_stream.is_stream());
+
+        let stream: InferenceGenerateRequest =
+            serde_json::from_value(serde_json::json!({"token_ids": [1], "stream": true})).unwrap();
+        assert!(stream.is_stream());
+    }
+
+    #[test]
+    fn test_inference_generate_get_model() {
+        let with_model: InferenceGenerateRequest =
+            serde_json::from_value(serde_json::json!({"token_ids": [1], "model": "m"})).unwrap();
+        assert_eq!(with_model.get_model(), Some("m"));
+
+        let without: InferenceGenerateRequest =
+            serde_json::from_value(serde_json::json!({"token_ids": [1]})).unwrap();
+        assert_eq!(without.get_model(), None);
+    }
 
     // ==================================================================
     // =            RERANK REQUEST TESTS                                =
@@ -3498,7 +3793,10 @@ mod tests {
             ChatMessage::Assistant {
                 content, reasoning, ..
             } => {
-                assert_eq!(content.as_ref().unwrap(), "Hello there!");
+                assert!(matches!(
+                    content.as_ref(),
+                    Some(UserMessageContent::Text(text)) if text == "Hello there!"
+                ));
                 assert_eq!(
                     reasoning.as_ref().unwrap(),
                     "Let me think about how to greet the user..."
@@ -3570,11 +3868,105 @@ mod tests {
         let message: ChatMessage = serde_json::from_str(json).unwrap();
 
         match message {
-            ChatMessage::System { content, .. } => {
-                assert_eq!(content, "You are a helpful assistant.");
-            }
+            ChatMessage::System {
+                content: UserMessageContent::Text(content),
+                ..
+            } => assert_eq!(content, "You are a helpful assistant."),
             _ => panic!("Expected System message"),
         }
+    }
+
+    #[test]
+    fn test_chat_message_system_content_blocks_round_trip() {
+        let json = serde_json::json!({
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "shared prefix"},
+                {"type": "text", "text": "session prefix"}
+            ]
+        });
+
+        let message: ChatMessage = serde_json::from_value(json.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(message).unwrap(), json);
+    }
+
+    #[test]
+    fn test_chat_request_program_text_includes_system_content_blocks() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "shared prefix"},
+                        {"type": "text", "text": "session prefix"}
+                    ]
+                },
+                {"role": "user", "content": "next turn"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request.extract_text_for_program_scheduling(),
+            "system:shared prefix\nsystem:session prefix\nuser:next turn"
+        );
+    }
+
+    #[test]
+    fn test_chat_request_keeps_session_id_for_native_routing() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "first turn"},
+                {"role": "assistant", "content": "previous completion"},
+                {"role": "user", "content": "next turn"}
+            ],
+            "session_params": {"session_id": "stable-session"}
+        }))
+        .unwrap();
+
+        assert_eq!(request.extract_text_for_routing(), "stable-session");
+        assert_eq!(
+            request.extract_text_for_program_scheduling(),
+            "user:first turn\nassistant:previous completion\nuser:next turn"
+        );
+    }
+
+    #[test]
+    fn test_chat_message_assistant_content_blocks_round_trip() {
+        let json = serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "previous completion"}
+            ]
+        });
+
+        let message: ChatMessage = serde_json::from_value(json.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(message).unwrap(), json);
+    }
+
+    #[test]
+    fn test_chat_request_program_text_includes_assistant_content_blocks() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "first turn"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "previous completion"}]
+                },
+                {"role": "user", "content": "next turn"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request.extract_text_for_program_scheduling(),
+            "user:first turn\nassistant:previous completion\nuser:next turn"
+        );
     }
 
     #[test]
@@ -3667,7 +4059,7 @@ mod tests {
     fn test_chat_message_roundtrip_serialization() {
         let original = ChatMessage::Assistant {
             role: "assistant".to_string(),
-            content: Some("Hello!".to_string()),
+            content: Some(UserMessageContent::Text("Hello!".to_string())),
             name: None,
             tool_calls: None,
             function_call: None,
@@ -3681,10 +4073,94 @@ mod tests {
             ChatMessage::Assistant {
                 content, reasoning, ..
             } => {
-                assert_eq!(content.as_ref().unwrap(), "Hello!");
+                assert!(matches!(
+                    content.as_ref(),
+                    Some(UserMessageContent::Text(text)) if text == "Hello!"
+                ));
                 assert_eq!(reasoning.as_ref().unwrap(), "Thinking...");
             }
             _ => panic!("Expected Assistant message"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_assistant_reasoning_content_alias_roundtrip() {
+        // Regression: assistant turns using the deprecated `reasoning_content`
+        // alias must survive forwarding and normalize to canonical `reasoning`.
+        let json = r#"{
+            "role": "assistant",
+            "content": "The answer is 42.",
+            "reasoning_content": "First I considered X, then Y..."
+        }"#;
+
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+        match &message {
+            ChatMessage::Assistant { reasoning, .. } => {
+                assert_eq!(
+                    reasoning.as_deref(),
+                    Some("First I considered X, then Y...")
+                );
+            }
+            _ => panic!("Expected Assistant message"),
+        }
+
+        // Re-serialization emits only vLLM's canonical field.
+        let serialized = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            serialized.get("reasoning").and_then(|v| v.as_str()),
+            Some("First I considered X, then Y..."),
+        );
+        assert!(serialized.get("reasoning_content").is_none());
+
+        let reparsed: ChatMessage = serde_json::from_value(serialized).unwrap();
+        match reparsed {
+            ChatMessage::Assistant { reasoning, .. } => {
+                assert_eq!(
+                    reasoning.as_deref(),
+                    Some("First I considered X, then Y...")
+                );
+            }
+            _ => panic!("Expected Assistant message"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_assistant_reasoning_alias_precedence() {
+        let cases = [
+            (
+                r#"{
+                    "role": "assistant",
+                    "reasoning": "canonical",
+                    "reasoning_content": "deprecated alias"
+                }"#,
+                "canonical",
+            ),
+            (
+                r#"{
+                    "role": "assistant",
+                    "reasoning": null,
+                    "reasoning_content": "deprecated alias"
+                }"#,
+                "deprecated alias",
+            ),
+            (
+                r#"{
+                    "role": "assistant",
+                    "reasoning": 42,
+                    "reasoning_content": "deprecated alias"
+                }"#,
+                "deprecated alias",
+            ),
+        ];
+
+        for (json, expected) in cases {
+            let message: ChatMessage = serde_json::from_str(json).unwrap();
+            match message {
+                ChatMessage::Assistant { reasoning, .. } => {
+                    assert_eq!(reasoning.as_deref(), Some(expected));
+                }
+                _ => panic!("Expected Assistant message"),
+            }
         }
     }
 }

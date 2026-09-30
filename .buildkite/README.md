@@ -7,7 +7,6 @@ This directory contains the Buildkite pipeline configurations for the vLLM Route
 ### `pipeline.yml`
 Main CI/CD pipeline that runs on all commits and pull requests. Includes:
 
-- **Fast Checks**: Code formatting and linting (Rust, Python)
 - **Build**: Release builds for Rust binary and Python wheels
 - **Tests**: Comprehensive test suite (unit, integration, Python)
 - **P/D Disaggregation Test**: GPU-based integration test for prefill/decode disaggregation
@@ -15,12 +14,14 @@ Main CI/CD pipeline that runs on all commits and pull requests. Includes:
 - **Docker Build**: Container image creation
 
 ### `release-pipeline.yml`
-Release pipeline triggered on version tags (e.g., `v1.2.3`). Handles:
+Release pipeline for tagged versions, nightly Docker images, and versioned
+Docker releases.
 
-- Building release artifacts
-- Publishing to PyPI
-- Building and pushing Docker images
-- Creating GitHub releases
+- **Git tags (`v*`):** build wheels, smoke-test, publish to PyPI
+- **`NIGHTLY=1`:** build and push `vllm/vllm-router:nightly` (multi-arch)
+- **Manual / API (no `NIGHTLY`):** fill **Provide Release version here**
+  (`X.Y.Z`), unblock the two Docker gates, and publish
+  `vllm/vllm-router:vX.Y.Z` plus `:latest` (and per-arch tags)
 
 ## P/D Disaggregation Test
 
@@ -59,10 +60,33 @@ The test runs in the pipeline at `.buildkite/pipeline.yml:97-132`:
 ```
 
 **Key features:**
-- Requires 4 GPUs (runs on `gpu_4_queue`)
+- Requires 4 GPUs (runs on `l4-k8s`)
 - 30 minute timeout
 - Automatic retry (up to 2 attempts) for flaky failures
 - Manual retry option available
+
+### ROCm MoRI coverage
+
+The dedicated `router_rocm_mi300_2` queue adds two MI300X matrices, each with
+`read_mode=true` and `read_mode=false`:
+
+- `run_moriio_accuracy_test.sh` uses two GPUs on one host with the xGMI backend.
+- `run_moriio_rdma_accuracy_test.sh` uses one GPU on each of two hosts with the
+  RDMA backend.
+
+The xGMI group runs for same-repository pull requests, the default branch, and
+merge-queue builds. Trusted manual/API builds can set `RUN_ROCM_XGMI=1`. The
+RDMA matrix runs for scheduled builds with `NIGHTLY=1`, or trusted manual/API
+builds with `RUN_ROCM_RDMA=1`. Group-level filtering prevents Docker plugin
+hooks from running for untrusted fork pull requests.
+
+ROCm-only scheduled builds should set both `NIGHTLY=1` and `ROCM_ONLY=1`.
+`ROCM_ONLY=1` skips the unrelated NVIDIA four-GPU P/D step while retaining the
+CPU build that supplies the router artifact to both ROCm matrices.
+
+Both matrices use a digest-pinned ROCm vLLM image and run health, sanity, and
+500-example GSM8K accuracy checks. The RDMA job is coordinator-owned and
+controls the second host through the strict `vllm-router-rocm-worker` SSH alias.
 
 ### Environment Variables
 
@@ -118,12 +142,6 @@ bash ./run_accuracy_test.sh
 
 ## Additional Pipeline Steps
 
-### Fast Checks
-Runs in parallel for quick feedback:
-- Rust format check (`cargo fmt`)
-- Clippy linting (`cargo clippy`)
-- Python format check (black, ruff)
-
 ### Build
 Creates release artifacts:
 - Rust binary (`target/release/vllm-router`)
@@ -144,7 +162,8 @@ Builds Docker image for the router.
 ## Agent Queues
 
 - `cpu_queue_premerge`: CPU-only tasks (builds, lints, unit tests)
-- `gpu_4_queue`: GPU tests requiring 4+ GPUs
+- `l4-k8s`: NVIDIA L4 GPU tests on EKS (4-GPU P/D disaggregation)
+- `router_rocm_mi300_2`: dedicated two-node MI300X MoRI tests (`spawn=1`)
 - `default`: General purpose queue
 
 ## Adding New Tests
